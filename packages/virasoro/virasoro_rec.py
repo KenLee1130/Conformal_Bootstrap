@@ -5,6 +5,190 @@ import numpy as np
 import torch.cuda.nvtx as nvtx  
 import os
 
+import os
+import json
+import math
+import numpy as np
+import torch
+from numba import cuda
+
+# ─────────────────────────────────────────────────────────
+# GPU Elliptic K with Numba-CUDA + PyTorch
+# ─────────────────────────────────────────────────────────
+@cuda.jit(device=True, inline=True)
+def _agm_K(m):
+    tol = 1e-14
+    a = 1.0
+    b = math.sqrt(1.0 - m)
+    it = 0
+    while abs(a - b) > tol * a and it < 40:
+        tmp = 0.5 * (a + b)
+        b = math.sqrt(a * b)
+        a = tmp
+        it += 1
+    return math.pi / (2.0 * a)
+
+@cuda.jit
+def _ellipk_kernel(m_arr, out_arr):
+    i = cuda.grid(1)
+    if i < m_arr.size:
+        out_arr[i] = _agm_K(m_arr[i])
+
+@cuda.jit
+def z_to_q_kernel(z, q):
+    i = cuda.grid(1)
+    if i < z.size:
+        q[i] = math.exp(-math.pi * _agm_K(1.0 - z[i]) / _agm_K(z[i]))
+
+
+def z_to_q_cuda(t: torch.Tensor) -> torch.Tensor:
+    """
+    Convert z -> q by q = exp(-pi*K(1-z)/K(z))
+    """
+    assert t.is_cuda, "Input must be on CUDA device"
+    assert t.dtype in (torch.float32, torch.float64)
+
+    m_nb = cuda.as_cuda_array(t)
+    out_nb = cuda.device_array(m_nb.shape, dtype=m_nb.dtype)
+    TPB = 16
+    blocks = (m_nb.size + TPB - 1) // TPB
+    z_to_q_kernel[blocks, TPB](m_nb, out_nb)
+    return torch.as_tensor(out_nb)
+
+# ----------------------------------------------
+# 0. JSON → flat arrays for Virasoro_coeffs
+# ----------------------------------------------
+from pathlib import Path
+
+def load_coeffs_packed_split(path: Path):
+    with open(path) as f:
+        raw = json.load(f)
+    items = sorted(raw.items(), key=lambda kv: int(kv[0]))
+    # containers
+    idx_num, val_num, ofs_num = [], [], [0]
+    idx_den, val_den, ofs_den = [], [], [0]
+    for k_str, rules in items:
+        for (i, j, l), c in rules['num']:
+            idx_num.append((i, j, l)); val_num.append(float(c))
+        ofs_num.append(len(idx_num))
+        for (i, j, l), c in rules['den']:
+            idx_den.append((i, j, l)); val_den.append(float(c))
+        ofs_den.append(len(idx_den))
+    return (
+        np.asarray(idx_num, dtype=np.int32),
+        np.asarray(val_num, dtype=np.float64),
+        np.asarray(ofs_num, dtype=np.int32),
+        np.asarray(idx_den, dtype=np.int32),
+        np.asarray(val_den, dtype=np.float64),
+        np.asarray(ofs_den, dtype=np.int32),
+    )
+
+# -------------------------------------------------------------
+# 1. Build H(c, h, hext) on the GPU
+# -------------------------------------------------------------
+@cuda.jit(device=True, inline=True)
+def _eval_poly_slice(idx, val, start, stop, b, h, hext):
+    s = 0.0
+    for t in range(start, stop):
+        i, j, l = idx[t]
+        s += val[t] * math.pow(b, i) * math.pow(h, j) * math.pow(hext, l)
+    return s
+
+@cuda.jit
+
+def _H_kernel(b_arr, hext_arr, h_arr,
+              idx_n, val_n, ofs_n,
+              idx_d, val_d, ofs_d,
+              kmax, Htbl):
+    ith, state, k = cuda.grid(3)
+    Nth, Np = h_arr.shape
+    Nk = kmax + 1
+    if ith >= Nth or state >= Np or k >= Nk:
+        return
+    h = h_arr[ith, state]
+    b = b_arr[ith]
+    hext = hext_arr[ith]
+    num = _eval_poly_slice(idx_n, val_n, ofs_n[k], ofs_n[k+1], b, h, hext)
+    den = _eval_poly_slice(idx_d, val_d, ofs_d[k], ofs_d[k+1], b, h, hext)
+    Htbl[ith, state, k] = 0.0 if (num == 0.0 and den == 0.0) else num/den
+
+
+def build_H_cuda(c_arr, h_grid, hext_arr,
+                 idx_n, val_n, ofs_n,
+                 idx_d, val_d, ofs_d,
+                 kmax):
+    inner = torch.sqrt(c_arr*c_arr - 26.0*c_arr + 25.0)
+    b_val = cuda.as_cuda_array(torch.sqrt(-(c_arr - 13.0 + inner))
+                                /(2.0*math.sqrt(3.0)))
+    h_d = cuda.to_device(h_grid)
+    hext_d = cuda.to_device(hext_arr)
+    idx_n_d, val_n_d, ofs_n_d = map(cuda.to_device, (idx_n, val_n, ofs_n))
+    idx_d_d, val_d_d, ofs_d_d = map(cuda.to_device, (idx_d, val_d, ofs_d))
+    Nth, p = h_grid.shape
+    H_d = cuda.device_array((Nth, p, kmax+1), dtype=np.float64)
+    TPB = (8,8,2)
+    blocks = (math.ceil(Nth/TPB[0]), math.ceil(p/TPB[1]), math.ceil((kmax+1)/TPB[2]))
+    _H_kernel[blocks, TPB](b_val, hext_d, h_d,
+                           idx_n_d, val_n_d, ofs_n_d,
+                           idx_d_d, val_d_d, ofs_d_d,
+                           kmax, H_d)
+    cuda.synchronize()
+    return H_d
+
+# -------------------------------------------------------------
+# 2. Build block table & G,v matrices (cross channel)
+# -------------------------------------------------------------
+@cuda.jit(device=True, inline=True)
+def theta3_trunc(q, kmax):
+    s=1.0
+    for n in range(kmax): s += 2.0*math.pow(q, (n+1)*(n+1))
+    return s
+
+@cuda.jit
+
+def block_table_kernel(q_all, z_all,
+                       h_vals, Harr,
+                       hext_arr, c_arr,
+                       kmax, kmax1,
+                       out_z):
+    iz, state, ith = cuda.grid(3)
+    Nth, Np, _ = Harr.shape
+    Nz = q_all.size
+    if ith>=Nth or state>=Np or iz>=Nz: return
+    q = q_all[iz]; z = z_all[iz]
+    h = h_vals[ith, state]; c = c_arr[ith]; hext=hext_arr[ith]
+    series = 0.0; qsq=q*q; qpow=1.0
+    for k in range(kmax+1):
+        if k>0: qpow *= qsq
+        series += Harr[ith,state,k] * qpow
+    t3 = theta3_trunc(q, kmax1)
+    exp_pref = (1.0-c)/24.0 + h
+    exp_z    = (c-1.0)/24.0 - 2.0*hext
+    exp_th   = (c-1.0)/2.0 - 16.0*hext
+    pref = (math.pow(16.0,exp_pref)*math.pow(q,exp_pref)
+            *math.pow(1.0-z,exp_z)*math.pow(z,exp_z)
+            *math.pow(t3,exp_th))
+    out_z[ith,state,iz] = series * pref
+
+@cuda.jit
+
+def make_G_v_kernel(table_z, table_zb, Nz, G, v):
+    ih, iz = cuda.grid(2)
+    Nh, Nqp = table_z.shape
+    if ih>=Nh or iz>=Nz: return
+    iz1 = iz+Nz
+    prod = table_z[ih,iz] * table_zb[ih,iz] \
+         - table_z[ih,iz1] * table_zb[ih,iz1]
+    G[ih,iz] = prod
+    if ih==0: v[iz] = -prod
+
+# -------------------------------------------------------------
+# Existing Virasoro_rec routines below:
+# (denom, lam_pq, Ppq, hmn, calc_Rmn_kernel, calc_Hmn_all_k,
+#  calc_H_kernel, calc_H_rec)
+# -------------------------------------------------------------
+# ... (keep your original Virasoro_rec code here) 
+
 
 
 @cuda.jit(device=True,inline=True)

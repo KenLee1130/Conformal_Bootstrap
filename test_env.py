@@ -930,7 +930,156 @@ def calculate_c_rew_with_w_G_test(W_diag,G,G0,c0,N_lsq=20):
 
     return c,residual #[N_stat,N_deltas, N_state] and [N_stat,N_deltas]
 
+@cuda.jit
+def make_G_v_kernel_th_spin(table_z, table_zb, Nz, G, v):
+    i0z, i0h, i0th = cuda.grid(3)
+    stride_z, stride_h, stride_th = cuda.gridsize(3)
+    Nth, Nh_full, Nqp = table_z.shape
+    Nh = Nh_full // 2
 
+    for iz in range(i0z, Nz, stride_z):
+        iz1 = iz + Nz
+        for ih in range(i0h, Nh + 1, stride_h):
+            ihb = 0 if ih == 0 else ih + Nh
+            for ith in range(i0th, Nth, stride_th):
+                prod = (
+                    table_z[ith, ih, iz] * table_zb[ith, ihb, iz]
+                    - table_z[ith, ih, iz1] * table_zb[ith, ihb, iz1]
+                )
+                G[ih, ith, iz] = prod
+                if ih == 0:
+                    v[ith, iz] = -prod
+
+def build_G_v_th_batch_spin(
+    h_mat, hbar_mat, z, zbar, c, hext,
+    idx_n, val_n, ofs_n, idx_d, val_d, ofs_d,
+    kmax=10, kmax1=10, analytic_H=False
+):
+    """
+    h_mat : (Nth, p)
+    Returns G_phys (Nth, Nz, p) and v (Nth, Nz)
+    """
+    Nth, p = h_mat.size()
+    assert h_mat.size() == hbar_mat.size()
+    assert len(c) == Nth
+    assert len(hext) == Nth
+
+    h_all = torch.cat([torch.zeros((Nth, 1), device=h_mat.device, dtype=h_mat.dtype),
+                       h_mat, hbar_mat], dim=1)
+    assert z.size() == zbar.size()
+    Nz = z.size()[0]
+
+    z1m = 1 - z
+    zbar1m = 1 - zbar
+    qqbar_all = z_to_q_cuda(torch.concat((z, zbar, z1m, zbar1m)))
+    q = qqbar_all[0:Nz]
+    qbar = qqbar_all[Nz:2*Nz]
+    q1mz = qqbar_all[2*Nz:3*Nz]
+    qbar1mz = qqbar_all[3*Nz:]
+
+    q_all = torch.cat([q, q1mz, qbar, qbar1mz], dim=0)
+    z_all = torch.cat([z, z1m, zbar, zbar1m], dim=0)
+    Nz_tot = len(z_all)
+
+    if kmax <= 4 and analytic_H:
+        Harr = build_H_cuda(c, h_all, hext, idx_n, val_n, ofs_n, idx_d, val_d, ofs_d, kmax)
+    else:
+        Harr = calc_H_rec(c, hext, hext, h_all, kmax + 2)
+
+    h_d = cuda.as_cuda_array(h_all)
+    hext_d = cuda.as_cuda_array(hext)
+    c_d = cuda.as_cuda_array(c)
+
+    qs_d = cuda.as_cuda_array(q_all)
+    zs_d = cuda.as_cuda_array(z_all)
+    H_d = cuda.as_cuda_array(Harr)
+    tbl_z = cuda.device_array((Nth, 2 * p + 1, Nz_tot), np.float64)
+
+    TPB1 = (2, 8, 8)
+    blocks1 = (
+        math.ceil(Nz_tot / TPB1[0]),
+        math.ceil((p + 1) / TPB1[1]),
+        math.ceil(Nth / TPB1[2]),
+    )
+
+    block_table_kernel[blocks1, TPB1](
+        qs_d, zs_d, h_d, H_d, hext_d, c_d, kmax, kmax1, tbl_z
+    )
+    cuda.synchronize()
+
+    G_big = cuda.device_array((p + 1, Nth, Nz), np.float64)
+    v_d = cuda.device_array((Nth, Nz), np.float64)
+
+    tbl_zb = tbl_z[:, :, 2 * Nz:]
+    tbl_z = tbl_z[:, :, :2 * Nz]
+
+    make_G_v_kernel_th_spin[blocks1, TPB1](tbl_z, tbl_zb, np.int32(Nz), G_big, v_d)
+    cuda.synchronize()
+
+    G_all = torch.as_tensor(G_big)
+    v = torch.as_tensor(v_d)
+
+    G_phys = G_all[1:].reshape(Nth, p, Nz).permute(0, 2, 1)
+    return G_phys, v
+
+def calculate_c_rew_th_spin(
+    h, hbar, z, zbar, hext, c_val,
+    coeffs, N_lsq=20, kmax=2, kmax1=10,
+    device="cuda", analytic_H=False
+):
+    idx_n, val_n, ofs_n, idx_d, val_d, ofs_d = coeffs
+    N_z = len(z)
+    N_th = len(h)
+    assert len(c_val) == N_th
+    assert len(hext) == N_th
+    assert N_z % N_lsq == 0, "N_z should be integer times N_lsq"
+    N_stat = N_z // N_lsq
+    N_state = len(h[0])
+
+    G, v = build_G_v_th_batch_spin(
+        h, hbar, z, zbar, c_val, hext,
+        idx_n, val_n, ofs_n, idx_d, val_d, ofs_d,
+        kmax=kmax, kmax1=kmax1, analytic_H=analytic_H
+    )
+
+    G = torch.as_tensor(G, device=device)
+    G = G.view((N_th, N_stat, N_lsq, N_state)).permute(1, 0, 2, 3)
+
+    v = torch.as_tensor(v, device=device)
+    v = v.view((N_th, N_stat, N_lsq)).permute(1, 0, 2)
+
+    c = torch.linalg.lstsq(G, v).solution
+    Gc = torch.einsum('sgzn,sgn->sgz', G, c)
+    residual_vector = Gc - v
+    residual = torch.einsum('sgz,sgz->sg', residual_vector, residual_vector)
+
+    return c, residual
+
+def least_sq_std_rew_and_c_th_spin(
+    theory, z, zbar, coeffs,
+    N_lsq=16, kmax=2, n_states_rew=2,
+    kmax1=10, device="cuda", analytic_H=False
+):
+    set_numba_device(device)
+
+    hhbar = theory[:, :-2]
+    p = hhbar.shape[1] // 2
+    h = hhbar[:, :p]
+    hbar = hhbar[:, p:]
+    c_val = theory[:, -2]
+    hext = theory[:, -1]
+
+    cs, rews = calculate_c_rew_th_spin(
+        h, hbar, z, zbar, hext, c_val,
+        coeffs, N_lsq=N_lsq, kmax=kmax,
+        kmax1=kmax1, device=device, analytic_H=analytic_H
+    )
+    c_mean = torch.mean(cs, 0)
+    c_std = torch.std(cs, 0)
+    r_stat = c_std / c_mean
+    r = -torch.sum(torch.log(torch.abs(r_stat[:, :n_states_rew])), dim=1)
+
+    return r, c_mean, c_std
 """
 GPU Elliptic K with Numba-CUDA + PyTorch
 ---------------------------------------
@@ -1241,9 +1390,11 @@ def make_G_v_kernel(table_z, table_zb,        # (Nh,Nqp)
         v[iz] = -prod
 
 if __name__ == "__main__":
+    from importlib import resources
     device = "cuda"
     dtype  = torch.float64
-    coeffs     = load_coeffs_packed_split("C:/Users/User/Desktop/git/Conformal_Bootstrap/packages/virasoro/virasoro_coeffs.json")
+    with resources.path("packages.virasoro", "virasoro_coeffs.json") as p:
+        coeffs = load_coeffs_packed_split(p)
     def plot_potential(
         phys_state,
         bounds2,
@@ -1262,22 +1413,52 @@ if __name__ == "__main__":
         Xg, Yg = np.meshgrid(xs, ys, indexing="xy")
 
         pts = torch.from_numpy(np.stack([Xg.ravel(), Yg.ravel()],1)).to(device, dtype=dtype)
-        Sgrid = torch.empty((pts.size(0),3), device=device, dtype=dtype)
-        Sgrid[:,0] = pts[:,0]
-        Sgrid[:,1] = phys_state[1]
-        Sgrid[:,2] = pts[:,1]
+        print(pts)
         z, zbar = generate_gaussian_points_positive(400, std=contour_std, device=device)
-        Rf, _, _ = least_sq_std_rew_and_c_th(
+
+        # Sgrid = torch.empty((pts.size(0),3), device=device, dtype=dtype)
+        # Sgrid[:,0] = pts[:,0]
+        # Sgrid[:,1] = phys_state[1]
+        # Sgrid[:,2] = pts[:,1]
+        # Rf, _, _ = least_sq_std_rew_and_c_th(
+        #     Sgrid, z, zbar, coeffs,
+        #     N_lsq=20, kmax=kmax, kmax1=kmax1,
+        #     n_states_rew=n_states_rew,
+        #     device=device
+        # )
+
+        Sgrid = torch.empty((pts.size(0),4), device=device, dtype=dtype)
+        Sgrid[:,0] = pts[:,0]
+        Sgrid[:,1] = phys_state[0]
+        Sgrid[:,2] = pts[:,1]
+        h_vals = pts[:, 0]
+        hbar_vals  = pts[:, 1]
+
+        Sgrid[:, 0] = h_vals
+        Sgrid[:, 1] = hbar_vals
+        Sgrid[:, 2] = phys_state[1]   # c_val，是标量会在广播时填满整列
+        Sgrid[:, 3] = phys_state[2]   # h_ext，同理
+
+        theory = Sgrid
+        hhbar = theory[:, :-2]
+        p = hhbar.shape[1] // 2
+        h = hhbar[:, :p]
+        hbar = hhbar[:, p:]
+        c_val = theory[:, -2]
+        hext = theory[:, -1]
+
+        #print(c_val.shape, hext.shape, h.shape, hbar.shape, z.shape)
+        Rf, _, _ = least_sq_std_rew_and_c_th_spin(
             Sgrid, z, zbar, coeffs,
-            N_lsq=20, kmax=kmax, kmax1=kmax1,
-            n_states_rew=n_states_rew,
-            device=device
+            N_lsq=20, kmax=2, n_states_rew=2,
+            kmax1=10, device="cuda", analytic_H=False
         )
         Rg = Rf.cpu().numpy().reshape(nx,ny)
 
         fig, ax = plt.subplots(figsize=(6,6))
         cf = ax.contourf(Xg, Yg, Rg, levels=50, cmap="viridis")
         fig.colorbar(cf, label="reward")
+        plt.show()
 
     plot_potential(
         phys_state=torch.tensor([1/7, -13/14-.001,-1/14], dtype=dtype, device=device),
